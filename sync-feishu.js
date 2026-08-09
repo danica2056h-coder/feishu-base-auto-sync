@@ -1,8 +1,7 @@
 const { chromium } = require('playwright');
-const { writeFile, unlink } = require('node:fs/promises');
 
 const URL = 'https://qingmutec.feishu.cn/base/SaMJbxVT8aieonsxJ8PcCw9YnHh?table=tbl2PzLA34XmPYpm&view=vewN6keiIV';
-const AUTH_FILE = 'feishu-storage-state.json';
+const AUTH_FILE = 'playwright/.auth/feishu.json';
 
 const fail = (code) => { throw new Error(code); };
 
@@ -10,11 +9,6 @@ const fail = (code) => { throw new Error(code); };
   let browser;
 
   try {
-    const encoded = process.env.FEISHU_STORAGE_STATE;
-    if (!encoded) fail('CLOUD_SESSION_REJECTED');
-
-    await writeFile(AUTH_FILE, Buffer.from(encoded, 'base64'), { mode: 0o600 });
-
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ storageState: AUTH_FILE });
     const page = await context.newPage();
@@ -79,6 +73,5 @@ const fail = (code) => { throw new Error(code); };
     process.exitCode = 1;
   } finally {
     await browser?.close().catch(() => {});
-    await unlink(AUTH_FILE).catch(() => {});
   }
 })();

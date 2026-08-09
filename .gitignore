@@ -3,4 +3,5 @@ playwright/.auth/
 .pw-profile/
 .playwright-browsers/
 feishu-storage-state.json
+FEISHU_AUTH_KEY.txt
 FEISHU_STORAGE_STATE_BASE64.txt
