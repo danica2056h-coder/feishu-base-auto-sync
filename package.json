@@ -1,0 +1,12 @@
+{
+  "name": "feishu-sync-mvp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "save-auth": "node save-auth.js",
+    "sync": "node sync-feishu.js"
+  },
+  "dependencies": {
+    "playwright": "1.54.2"
+  }
+}
