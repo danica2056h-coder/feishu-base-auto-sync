@@ -2,7 +2,6 @@ name: Feishu Sync
 
 on:
   workflow_dispatch:
-  # 后续确认固定执行时间后，可在此加入 schedule。
 
 jobs:
   sync:
@@ -14,8 +13,13 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
       - run: npx playwright install --with-deps chromium
-      - run: node sync-feishu.js
+      - name: Decrypt Feishu authentication
+        run: node decrypt-auth.js
         env:
-          FEISHU_STORAGE_STATE: ${{ secrets.FEISHU_STORAGE_STATE }}
+          FEISHU_AUTH_KEY: ${{ secrets.FEISHU_AUTH_KEY }}
+      - run: node sync-feishu.js
+      - name: Clean up decrypted authentication
+        if: always()
+        run: rm -f playwright/.auth/feishu.json
