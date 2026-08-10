@@ -1,11 +1,13 @@
 const AUTH_FILE = 'playwright/.auth/feishu.json';
 const BASE_URL = process.env.FEISHU_BASE_URL || process.argv[2];
 const MENU_TEXT = '同步数据';
-const TABLE_ITEM_SELECTORS = [
-  '[role="treeitem"]',
-  '[data-testid*="table-item"]',
-  '[data-entity-type="table"]'
-].join(',');
+const TABLE_NAME_SELECTOR = '.bitable-new-table-tab__item-name';
+const TABLE_ROW_XPATH = 'xpath=ancestor::div[contains(@class,"bitable-new-table-item")][1]';
+const CONNECTOR_ICON_SELECTOR = '.sync-icon-wrapper';
+const TABLE_MENU_SELECTOR = '.bitable-new-table-tab__item-icons';
+const TABLE_SCAN_TIMEOUT_MS = 3_000;
+const SYNC_CONFIRM_TIMEOUT_MS = 120_000;
+const MAX_BASE_DURATION_MS = 8 * 60_000;
 
 class SyncError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -18,146 +20,221 @@ function cleanName(value) {
   return String(value || '').split('\n').map((part) => part.trim()).find(Boolean) || '';
 }
 
+function errorCode(error) {
+  return error?.code || error?.message || 'SYNC_FAILED';
+}
+
+function remainingMs(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+
+async function withTimeout(promise, timeoutMs, code) {
+  if (timeoutMs <= 0) fail(code);
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new SyncError(code)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function assertAuthenticated(page) {
   const loginText = page.getByText(/登录|扫码登录|验证码/).filter({ visible: true }).first();
   if (/login|accounts/i.test(page.url()) || await visible(loginText)) fail('CLOUD_SESSION_REJECTED');
 }
 
-async function sidebarTableItems(page) {
-  await page.waitForTimeout(2_000);
-  const direct = page.locator(TABLE_ITEM_SELECTORS).filter({ visible: true });
-  const count = await direct.count();
-  const candidates = [];
+async function snapshotTableNames(page, deadline) {
+  const timeout = Math.min(10_000, remainingMs(deadline));
+  const names = await withTimeout(
+    page.locator(TABLE_NAME_SELECTOR).filter({ visible: true }).allTextContents(),
+    timeout,
+    'TABLE_LIST_TIMEOUT'
+  );
+  return [...new Set(names.map(cleanName).filter(Boolean))];
+}
+
+async function findTableRow(page, tableName, timeoutMs = TABLE_SCAN_TIMEOUT_MS) {
+  const names = page.locator(TABLE_NAME_SELECTOR).filter({ visible: true });
+  const count = await withTimeout(names.count(), timeoutMs, 'TABLE_RELOCATE_TIMEOUT');
 
   for (let index = 0; index < count; index += 1) {
-    const item = direct.nth(index);
-    const name = cleanName(await item.innerText().catch(() => ''));
-    const box = await item.boundingBox().catch(() => null);
-    if (name && box && box.width > 20 && box.height >= 18) candidates.push({ item, name, box });
+    const name = cleanName(await withTimeout(
+      names.nth(index).innerText({ timeout: timeoutMs }),
+      timeoutMs,
+      'TABLE_RELOCATE_TIMEOUT'
+    ));
+    if (name === tableName) return names.nth(index).locator(TABLE_ROW_XPATH);
   }
-
-  if (candidates.length) return deduplicate(candidates);
-
-  // Feishu occasionally removes semantic roles. Restrict the geometric scan to the
-  // left navigation rail; table names remain visible text and are never hard-coded.
-  const viewport = page.viewportSize() || { width: 1280, height: 720 };
-  const textNodes = page.locator('div,span').filter({ visible: true });
-  const textCount = await textNodes.count();
-  for (let index = 0; index < Math.min(textCount, 1_500); index += 1) {
-    const item = textNodes.nth(index);
-    const box = await item.boundingBox().catch(() => null);
-    if (!box || box.x > viewport.width * 0.34 || box.height < 18 || box.height > 52 || box.width < 30) continue;
-    const name = cleanName(await item.innerText().catch(() => ''));
-    if (!name || name.length > 100) continue;
-    candidates.push({ item, name, box });
-  }
-  return deduplicate(candidates);
+  fail('TABLE_NOT_FOUND_AFTER_REFRESH');
 }
 
-function deduplicate(candidates) {
-  const seen = new Set();
-  return candidates.filter(({ name, box }) => {
-    const key = `${name}|${Math.round(box.y / 3)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).sort((a, b) => a.box.y - b.box.y);
+async function detectConnector(page, tableName) {
+  // Always re-read the current sidebar DOM. A completed sync can rerender every row.
+  const row = await findTableRow(page, tableName, TABLE_SCAN_TIMEOUT_MS);
+  return visible(row.locator(CONNECTOR_ICON_SELECTOR).first());
 }
 
-async function openTableMenu(page, candidate) {
-  await candidate.item.hover().catch(() => {});
-  await page.waitForTimeout(350);
-
-  const localMenu = candidate.item.locator('button,[role="button"]').filter({ visible: true }).last();
-  if (await visible(localMenu)) {
-    await localMenu.click().catch(() => {});
-  } else {
-    const current = await candidate.item.boundingBox().catch(() => candidate.box);
-    await page.mouse.click(current.x + current.width + 18, current.y + current.height / 2);
-  }
-  await page.waitForTimeout(500);
-  return page.getByText(MENU_TEXT, { exact: true }).filter({ visible: true }).first();
+async function openTableMenu(page, tableName, deadline) {
+  // Re-locate again immediately before interaction; never reuse a row from detection.
+  const timeout = Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline));
+  const row = await findTableRow(page, tableName, timeout);
+  await row.hover({ timeout });
+  const menuButton = row.locator(TABLE_MENU_SELECTOR).first();
+  await menuButton.click({ timeout });
+  const syncButton = page.getByText(MENU_TEXT, { exact: true }).filter({ visible: true }).first();
+  await syncButton.waitFor({ state: 'visible', timeout });
+  return syncButton;
 }
 
-async function waitForSync(page, previousText) {
-  const successToast = page.getByText(/同步成功|同步完成|数据同步完成/, { exact: false })
+function successToastLocator(page) {
+  return page.getByText(/同步成功|同步完成|数据同步完成/, { exact: false })
     .filter({ visible: true }).first();
-  const toastPromise = successToast.waitFor({ state: 'visible', timeout: 120_000 }).then(() => true);
+}
+
+async function waitForSync(page, previousText, timeoutMs, allowToast) {
+  const toastPromise = allowToast
+    ? successToastLocator(page).waitFor({ state: 'visible', timeout: timeoutMs }).then(() => true)
+    : Promise.reject(new Error('STALE_SUCCESS_TOAST'));
   const changedPromise = previousText
     ? page.waitForFunction((oldText) => {
         const current = document.body.innerText.split('\n').find((row) => /上次同步|最近同步/.test(row));
         return Boolean(current && current !== oldText);
-      }, previousText, { timeout: 120_000 }).then(() => true)
-    : new Promise((_, reject) => setTimeout(() => reject(new Error('NO_PREVIOUS_SYNC_TEXT')), 120_000));
+      }, previousText, { timeout: timeoutMs }).then(() => true)
+    : new Promise((_, reject) => setTimeout(() => reject(new Error('NO_PREVIOUS_SYNC_TEXT')), timeoutMs));
   return Promise.any([toastPromise, changedPromise]).catch(() => false);
 }
 
-async function syncCandidate(page, candidate) {
-  const syncButton = await openTableMenu(page, candidate);
-  if (!await visible(syncButton)) {
-    await page.keyboard.press('Escape').catch(() => {});
-    return { syncable: false };
+async function syncTable(page, tableName, deadline) {
+  const previousToast = successToastLocator(page);
+  if (await visible(previousToast)) {
+    await previousToast.waitFor({ state: 'hidden', timeout: TABLE_SCAN_TIMEOUT_MS }).catch(() => {});
   }
-
-  console.log(`TABLE_FOUND=${candidate.name}`);
-  console.log(`TABLE_SYNC_START=${candidate.name}`);
+  const allowToast = !await visible(previousToast);
+  const syncButton = await openTableMenu(page, tableName, deadline);
   const lastSync = page.getByText(/上次同步|最近同步/, { exact: false }).filter({ visible: true }).first();
-  const before = await lastSync.textContent().catch(() => null);
-  await syncButton.click();
-  if (!await waitForSync(page, before)) throw new SyncError('SYNC_NOT_CONFIRMED');
-  console.log(`TABLE_SYNC_SUCCESS=${candidate.name}`);
-  return { syncable: true };
+  const before = await lastSync.textContent({ timeout: TABLE_SCAN_TIMEOUT_MS }).catch(() => null);
+  await syncButton.click({ timeout: Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline)) });
+  const confirmTimeout = Math.min(SYNC_CONFIRM_TIMEOUT_MS, remainingMs(deadline));
+  if (!await waitForSync(page, before, confirmTimeout, allowToast)) fail('SYNC_NOT_CONFIRMED');
+}
+
+async function processTableNames(page, tableNames, options = {}) {
+  const deadline = options.deadline || Date.now() + MAX_BASE_DURATION_MS;
+  const inspect = options.detectConnector || detectConnector;
+  const sync = options.syncTable || syncTable;
+  const log = options.log || console.log;
+  const scanTimeoutMs = options.scanTimeoutMs || TABLE_SCAN_TIMEOUT_MS;
+  const stats = options.stats || {
+    totalTables: tableNames.length,
+    connectorTablesFound: 0,
+    syncSuccessCount: 0,
+    syncFailedCount: 0,
+    successfulTableNames: []
+  };
+
+  for (const tableName of tableNames) {
+    if (remainingMs(deadline) <= 0) fail('BASE_TIMEOUT_8_MINUTES');
+    log(`TABLE_SCAN_START=${tableName}`);
+
+    let isConnector;
+    try {
+      isConnector = await withTimeout(
+        Promise.resolve().then(() => inspect(page, tableName)),
+        Math.min(scanTimeoutMs, remainingMs(deadline)),
+        'TABLE_SCAN_TIMEOUT'
+      );
+    } catch (error) {
+      stats.syncFailedCount += 1;
+      log(`TABLE_SCAN_ERROR=${tableName}`);
+      log(`ERROR=${errorCode(error)}`);
+      continue;
+    }
+
+    if (!isConnector) {
+      log(`TABLE_SKIP_NO_CONNECTOR=${tableName}`);
+      continue;
+    }
+
+    stats.connectorTablesFound += 1;
+    log(`TABLE_SYNC_START=${tableName}`);
+    try {
+      await sync(page, tableName, deadline);
+      stats.syncSuccessCount += 1;
+      stats.successfulTableNames.push(tableName);
+      log(`TABLE_SYNC_SUCCESS=${tableName}`);
+    } catch (error) {
+      stats.syncFailedCount += 1;
+      log(`TABLE_SCAN_ERROR=${tableName}`);
+      log(`ERROR=${errorCode(error)}`);
+      await page.keyboard.press('Escape').catch(() => {});
+    }
+  }
+  return stats;
+}
+
+function printSummary(stats) {
+  console.log(`TOTAL_TABLES=${stats.totalTables}`);
+  console.log(`CONNECTOR_TABLES_FOUND=${stats.connectorTablesFound}`);
+  console.log(`SYNC_SUCCESS_COUNT=${stats.syncSuccessCount}`);
+  console.log(`SYNC_FAILED_COUNT=${stats.syncFailedCount}`);
+  console.log(`SYNC_SUCCESS_NAMES=${JSON.stringify(stats.successfulTableNames)}`);
 }
 
 async function run() {
   if (!BASE_URL) fail('BASE_URL_MISSING');
   const { chromium } = require('playwright');
+  const deadline = Date.now() + MAX_BASE_DURATION_MS;
+  const stats = {
+    totalTables: 0,
+    connectorTablesFound: 0,
+    syncSuccessCount: 0,
+    syncFailedCount: 0,
+    successfulTableNames: []
+  };
   let browser;
-  let total = 0;
-  let success = 0;
-  let failed = 0;
   console.log(`BASE=${BASE_URL}`);
 
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await withTimeout(chromium.launch({ headless: true }), remainingMs(deadline), 'BASE_TIMEOUT_8_MINUTES');
     const context = await browser.newContext({ storageState: AUTH_FILE });
     const page = await context.newPage();
-    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-      .catch(() => fail('BASE_OPEN_FAILED'));
+    await page.goto(BASE_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: Math.min(60_000, remainingMs(deadline))
+    }).catch(() => fail('BASE_OPEN_FAILED'));
     await assertAuthenticated(page);
 
-    const candidates = await sidebarTableItems(page);
-    if (!candidates.length) fail('TABLE_LIST_NOT_FOUND');
+    const tableNames = await snapshotTableNames(page, deadline);
+    if (!tableNames.length) fail('TABLE_LIST_NOT_FOUND');
+    stats.totalTables = tableNames.length;
+    await processTableNames(page, tableNames, { deadline, stats });
 
-    for (const candidate of candidates) {
-      try {
-        const result = await syncCandidate(page, candidate);
-        if (result.syncable) { total += 1; success += 1; }
-      } catch (error) {
-        total += 1;
-        failed += 1;
-        console.error(`FAILED_TABLE=${candidate.name}`);
-        console.error(`ERROR=${error.code || error.message || 'SYNC_FAILED'}`);
-        await page.keyboard.press('Escape').catch(() => {});
-      }
-    }
-
-    console.log(`TOTAL_SYNCABLE_TABLES=${total}`);
-    console.log(`SUCCESS=${success}`);
-    console.log(`FAILED=${failed}`);
-    if (!total) fail('NO_SYNCABLE_TABLES');
-    if (failed) fail('BASE_PARTIAL_FAILURE');
+    if (!stats.connectorTablesFound) fail('NO_SYNCABLE_TABLES');
+    if (stats.syncFailedCount) fail('BASE_PARTIAL_FAILURE');
     console.log('BASE_SYNC_SUCCESS');
   } finally {
+    printSummary(stats);
     await browser?.close().catch(() => {});
   }
 }
 
 if (require.main === module) {
   run().catch((error) => {
-    console.error(`ERROR=${error.code || error.message || 'SYNC_FAILED'}`);
+    console.error(`ERROR=${errorCode(error)}`);
     process.exitCode = 1;
   });
 }
 
-module.exports = { cleanName, deduplicate, run };
+module.exports = {
+  cleanName,
+  detectConnector,
+  findTableRow,
+  processTableNames,
+  snapshotTableNames,
+  withTimeout
+};
