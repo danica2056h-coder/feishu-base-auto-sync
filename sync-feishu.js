@@ -116,7 +116,7 @@ async function run() {
   let total = 0;
   let success = 0;
   let failed = 0;
-  console.log(`BASE_START=${BASE_URL}`);
+  console.log(`BASE=${BASE_URL}`);
 
   try {
     browser = await chromium.launch({ headless: true });
