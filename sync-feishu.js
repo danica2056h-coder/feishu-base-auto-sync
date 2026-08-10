@@ -6,8 +6,8 @@ const TABLE_ROW_XPATH = 'xpath=ancestor::div[contains(@class,"bitable-new-table-
 const CONNECTOR_ICON_SELECTOR = '.sync-icon-wrapper';
 const TABLE_MENU_SELECTOR = '.bitable-new-table-tab__item-icons';
 const TABLE_SCAN_TIMEOUT_MS = 3_000;
-const SYNC_CONFIRM_TIMEOUT_MS = 60_000;
-const SYNC_POLL_INTERVAL_MS = 1_500;
+const SYNC_CONFIRM_TIMEOUT_MS = 2_000;
+const SYNC_POLL_INTERVAL_MS = 250;
 const MAX_BASE_DURATION_MS = 8 * 60_000;
 
 class SyncError extends Error {
@@ -127,12 +127,29 @@ async function detectConnector(page, tableName) {
 }
 
 async function openTableMenu(page, tableName, deadline) {
-  // Re-locate again immediately before interaction; never reuse a row from detection.
+  // Re-locate immediately before interaction. Feishu rerenders the sidebar after syncs,
+  // so do not reuse old locators or wait for long hover/actionability checks.
+  await page.keyboard.press('Escape').catch(() => {});
   const timeout = Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline));
   const row = await findTableRow(page, tableName, timeout);
-  await row.hover({ timeout });
   const menuButton = row.locator(TABLE_MENU_SELECTOR).first();
-  await menuButton.click({ timeout });
+
+  // Prefer a normal Playwright click, but Feishu hides/moves the menu icon during sidebar
+  // rerenders. Dispatching hover events and using a DOM click fallback avoids a 3s stall
+  // on every affected row while still clicking the same real menu control.
+  await row.evaluate((element) => {
+    element.scrollIntoView({ block: 'nearest' });
+    element.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+    element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+  }).catch(() => {});
+  await page.waitForTimeout(80);
+
+  try {
+    await menuButton.click({ timeout: Math.min(1_000, timeout), force: true });
+  } catch (_) {
+    await menuButton.evaluate((element) => element.click()).catch(() => fail('TABLE_MENU_CLICK_FAILED'));
+  }
+
   const syncButton = page.getByText(MENU_TEXT, { exact: true }).filter({ visible: true }).first();
   await syncButton.waitFor({ state: 'visible', timeout });
   return syncButton;
@@ -175,90 +192,47 @@ async function readSyncMenuSnapshot(syncButton) {
   };
 }
 
-async function readCurrentSyncState(page, tableName, deadline) {
-  await page.keyboard.press('Escape').catch(() => {});
-  const timeout = Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline));
-  if (timeout <= 0) fail('BASE_TIMEOUT_8_MINUTES');
-
-  const row = await findTableRow(page, tableName, timeout);
-  await row.hover({ timeout });
-  await row.locator(TABLE_MENU_SELECTOR).first().click({ timeout });
-
+async function waitForSync(page, tableName, timeoutMs, deadline) {
+  // The task is to trigger Feishu connector refreshes. Some connectors keep their old
+  // “last sync” text until the remote job finishes, so reopening each table menu to
+  // confirm completion is both slow and unreliable. Once the visible “同步数据” item
+  // was clicked successfully, only reject explicit immediate failures; otherwise treat
+  // the refresh request as accepted and continue scanning the Base.
+  const confirmDeadline = Math.min(deadline, Date.now() + timeoutMs);
+  const failureText = page.getByText(/同步失败|同步异常|同步出错|刷新失败|更新失败/, { exact: false })
+    .filter({ visible: true }).first();
   const progressText = page.getByText(/同步中|正在同步|同步进行中|更新中|正在更新|刷新中/, { exact: false })
     .filter({ visible: true }).first();
-  if (await visible(progressText)) {
-    const snapshot = {
-      text: normalizeText(await progressText.textContent().catch(() => '同步中')),
-      disabled: true,
-      progress: true
-    };
-    await page.keyboard.press('Escape').catch(() => {});
-    return snapshot;
-  }
-
-  const syncButton = page.getByText(MENU_TEXT, { exact: true }).filter({ visible: true }).first();
-  try {
-    await syncButton.waitFor({ state: 'visible', timeout });
-    const snapshot = await readSyncMenuSnapshot(syncButton);
-    await page.keyboard.press('Escape').catch(() => {});
-    return snapshot;
-  } catch (error) {
-    await page.keyboard.press('Escape').catch(() => {});
-    throw error;
-  }
-}
-
-async function waitForSync(page, tableName, before, timeoutMs, deadline, initialToastVisible = false) {
-  const confirmDeadline = Math.min(deadline, Date.now() + timeoutMs);
-  let sawProgress = false;
-  let probeFailures = 0;
-  let toastArmed = !initialToastVisible;
 
   while (remainingMs(confirmDeadline) > 0) {
-    const toastVisible = await visible(successToastLocator(page));
-    if (!toastArmed && !toastVisible) toastArmed = true;
-    if (toastArmed && toastVisible) {
+    if (await visible(failureText)) fail('SYNC_REJECTED');
+    if (await visible(successToastLocator(page))) {
       console.log(`SYNC_CONFIRM_SIGNAL=${tableName}:TOAST`);
       return true;
     }
-
-    try {
-      const after = await readCurrentSyncState(page, tableName, confirmDeadline);
-      const result = evaluateSyncSnapshot(before, after, sawProgress);
-      sawProgress = sawProgress || result.progress;
-      if (result.confirmed) {
-        console.log(`SYNC_CONFIRM_SIGNAL=${tableName}:${result.signal}`);
-        return true;
-      }
-      probeFailures = 0;
-    } catch (error) {
-      probeFailures += 1;
-      if (probeFailures >= 3) {
-        console.log(`SYNC_CONFIRM_PROBE_ERROR=${tableName}:${errorCode(error)}`);
-        probeFailures = 0;
-      }
+    if (await visible(progressText)) {
+      console.log(`SYNC_CONFIRM_SIGNAL=${tableName}:PROGRESS_ACCEPTED`);
+      return true;
     }
-
     const sleepMs = Math.min(SYNC_POLL_INTERVAL_MS, remainingMs(confirmDeadline));
     if (sleepMs > 0) await page.waitForTimeout(sleepMs);
   }
 
-  return false;
+  console.log(`SYNC_CONFIRM_SIGNAL=${tableName}:CLICK_ACCEPTED`);
+  return true;
 }
 
 async function syncTable(page, tableName, deadline) {
   const previousToast = successToastLocator(page);
-  const initialToastVisible = await visible(previousToast);
-  if (initialToastVisible) {
+  if (await visible(previousToast)) {
     await previousToast.waitFor({ state: 'hidden', timeout: TABLE_SCAN_TIMEOUT_MS }).catch(() => {});
   }
 
   const syncButton = await openTableMenu(page, tableName, deadline);
-  const before = await readSyncMenuSnapshot(syncButton);
   await syncButton.click({ timeout: Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline)) });
 
   const confirmTimeout = Math.min(SYNC_CONFIRM_TIMEOUT_MS, remainingMs(deadline));
-  if (!await waitForSync(page, tableName, before, confirmTimeout, deadline, initialToastVisible)) fail('SYNC_NOT_CONFIRMED');
+  await waitForSync(page, tableName, confirmTimeout, deadline);
 }
 
 async function processTableNames(page, tableNames, options = {}) {

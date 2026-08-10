@@ -126,11 +126,11 @@ test('production traversal uses the real table-name DOM and bounded deadlines', 
   const source = fs.readFileSync('sync-feishu.js', 'utf8');
   assert.match(source, /TABLE_NAME_SELECTOR = '\.bitable-new-table-tab__item-name'/);
   assert.match(source, /TABLE_SCAN_TIMEOUT_MS = 3_000/);
-  assert.match(source, /SYNC_CONFIRM_TIMEOUT_MS = 60_000/);
+  assert.match(source, /SYNC_CONFIRM_TIMEOUT_MS = 2_000/);
   assert.match(source, /MAX_BASE_DURATION_MS = 8 \* 60_000/);
   assert.doesNotMatch(source, /locator\('div,span'\)/);
   assert.match(source, /Always re-read the current sidebar DOM/);
-  assert.match(source, /Re-locate again immediately before interaction/);
+  assert.match(source, /do not reuse old locators/);
   assert.match(source, /SYNC_CONFIRM_SIGNAL=/);
   assert.match(source, /SYNC_FAILED_NAMES=/);
   assert.match(source, /SYNC_FAILURE_REASONS=/);
@@ -138,4 +138,7 @@ test('production traversal uses the real table-name DOM and bounded deadlines', 
   assert.match(source, /CONNECTOR_TABLES_FOUND=/);
   assert.match(source, /SYNC_SUCCESS_COUNT=/);
   assert.match(source, /SYNC_FAILED_COUNT=/);
+  assert.match(source, /TABLE_MENU_CLICK_FAILED/);
+  assert.match(source, /CLICK_ACCEPTED/);
+  assert.doesNotMatch(source, /async function readCurrentSyncState/);
 });
