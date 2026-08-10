@@ -4,33 +4,43 @@ const CONTROL_COLUMNS = 6;
 const CONTROL_SPREADSHEET_ID = '1sECJFkdrO_67wkLi68Eh2602Z9N1ppNfBEQUTTFNa9Q';
 
 function doGet(e) {
-  return handleRequest_(e && e.parameter ? e.parameter : {}, 'GET');
+  try {
+    return handleRequest_(e && e.parameter ? e.parameter : {}, 'GET');
+  } catch (error) {
+    return json_({ ok: false, error: errorCode_(error) });
+  }
 }
 
 function doPost(e) {
-  let payload = {};
-  try { payload = JSON.parse((e && e.postData && e.postData.contents) || '{}'); }
-  catch (error) { return json_({ ok: false, error: 'INVALID_JSON' }); }
-  return handleRequest_(payload, 'POST');
+  try {
+    const payload = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    return handleRequest_(payload, 'POST');
+  } catch (error) {
+    return json_({ ok: false, error: error instanceof SyntaxError ? 'INVALID_JSON' : errorCode_(error) });
+  }
 }
 
 function handleRequest_(payload, method) {
   try {
     verifySecret_(payload.secret);
-    if (method === 'GET' && payload.action === 'claim') {
-      return json_({ ok: true, tasks: claimTasks_(payload.mode || 'due', payload.row) });
+    if (method === 'GET' && payload.action === 'check') {
+      return json_({ ok: true, action: 'check', tasks: claimTasks_(payload.mode || 'due', payload.row) });
     }
     if (method === 'POST' && payload.action === 'complete') {
       completeTask_(payload);
-      return json_({ ok: true });
+      return json_({ ok: true, action: 'complete' });
     }
     if (method === 'GET' && payload.action === 'health') {
-      return json_({ ok: true, timeZone: CONTROL_TIME_ZONE });
+      return json_({ ok: true, action: 'health', timeZone: CONTROL_TIME_ZONE });
     }
     throw new Error('INVALID_ACTION');
   } catch (error) {
     return json_({ ok: false, error: String(error.message || error).slice(0, 120) });
   }
+}
+
+function errorCode_(error) {
+  return String(error && error.message ? error.message : error || 'UNKNOWN_ERROR').slice(0, 120);
 }
 
 function verifySecret_(provided) {
