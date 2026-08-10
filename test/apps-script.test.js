@@ -89,6 +89,66 @@ test('doGet returns unified JSON with tasks', () => {
   assert.equal(body.tasks[0].row, 2);
 });
 
+function installClaimHarness(script, rows) {
+  const properties = new Map();
+  const lockEvents = [];
+  const sheet = {
+    getLastRow: () => rows.length + 1,
+    getRange(row, column) {
+      if (row === 2 && column === 1) return { getValues: () => rows };
+      return {
+        setValue(value) { rows[row - 2][column - 1] = value; }
+      };
+    }
+  };
+  const props = {
+    getProperty: (key) => properties.get(key) || null,
+    setProperty: (key, value) => properties.set(key, value),
+    deleteProperty: (key) => properties.delete(key)
+  };
+  script.getControlSheet_ = () => sheet;
+  script.PropertiesService = { getScriptProperties: () => props };
+  script.LockService = {
+    getScriptLock: () => ({
+      waitLock: () => lockEvents.push('wait'),
+      releaseLock: () => lockEvents.push('release')
+    })
+  };
+  script.SpreadsheetApp = { flush() {} };
+  return { properties, lockEvents };
+}
+
+test('row claim selects only the requested manual trigger and prevents a duplicate claim', () => {
+  const script = loadScript();
+  const rows = [
+    ['https://example.invalid/base/2', '', true, '', '', ''],
+    ['https://example.invalid/base/3', '', true, '', '', '']
+  ];
+  const { lockEvents } = installClaimHarness(script, rows);
+
+  const first = script.claimTasks_('row', '2');
+  const second = script.claimTasks_('row', '2');
+
+  assert.deepEqual(Array.from(first, (task) => task.row), [2]);
+  assert.deepEqual(Array.from(second, (task) => task.row), []);
+  assert.equal(rows[0][3], '同步中');
+  assert.deepEqual(lockEvents, ['wait', 'release', 'wait', 'release']);
+});
+
+test('due claim selects scheduled tasks and outstanding manual triggers', () => {
+  const script = loadScript();
+  const rows = [
+    ['https://example.invalid/base/2', '每天 09:45', false, '', '', ''],
+    ['https://example.invalid/base/3', '每天 12:30', false, '', '', ''],
+    ['https://example.invalid/base/4', '', true, '', '', '']
+  ];
+  installClaimHarness(script, rows);
+
+  const tasks = script.claimTasks_('due', '');
+
+  assert.deepEqual(Array.from(tasks, (task) => task.row), [2, 4]);
+});
+
 test('doPost returns unified JSON after completion', () => {
   const script = loadScript();
   script.completeTask_ = () => {};
