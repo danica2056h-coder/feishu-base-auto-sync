@@ -6,7 +6,8 @@ const {
   cleanName,
   evaluateSyncSnapshot,
   processTableNames,
-  relativeAgeSeconds
+  relativeAgeSeconds,
+  tableMenuPoint
 } = require('../sync-feishu');
 
 test('table names are normalized without hard-coded targets', () => {
@@ -122,6 +123,15 @@ test('a stuck non-connector detection is capped and later tables are still scann
   assert.ok(logs.includes('TABLE_SKIP_NO_CONNECTOR=后续普通表'));
 });
 
+
+
+test('table menu fallback targets the row right-edge ellipsis area', () => {
+  assert.deepEqual(
+    tableMenuPoint({ x: 100, y: 40, width: 260, height: 32 }),
+    { x: 344, y: 56 }
+  );
+  assert.equal(tableMenuPoint(null), null);
+});
 test('production traversal uses the real table-name DOM and bounded deadlines', () => {
   const source = fs.readFileSync('sync-feishu.js', 'utf8');
   assert.match(source, /TABLE_NAME_SELECTOR = '\.bitable-new-table-tab__item-name'/);
@@ -130,7 +140,9 @@ test('production traversal uses the real table-name DOM and bounded deadlines', 
   assert.match(source, /MAX_BASE_DURATION_MS = 8 \* 60_000/);
   assert.doesNotMatch(source, /locator\('div,span'\)/);
   assert.match(source, /Always re-read the current sidebar DOM/);
-  assert.match(source, /do not reuse old locators/);
+  assert.match(source, /Select the table first/);
+  assert.match(source, /tableMenuPoint/);
+  assert.match(source, /page\.mouse\.click\(point\.x, point\.y\)/);
   assert.match(source, /SYNC_CONFIRM_SIGNAL=/);
   assert.match(source, /SYNC_FAILED_NAMES=/);
   assert.match(source, /SYNC_FAILURE_REASONS=/);

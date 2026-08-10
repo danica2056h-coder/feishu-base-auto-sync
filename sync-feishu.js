@@ -4,7 +4,7 @@ const MENU_TEXT = '同步数据';
 const TABLE_NAME_SELECTOR = '.bitable-new-table-tab__item-name';
 const TABLE_ROW_XPATH = 'xpath=ancestor::div[contains(@class,"bitable-new-table-item")][1]';
 const CONNECTOR_ICON_SELECTOR = '.sync-icon-wrapper';
-const TABLE_MENU_SELECTOR = '.bitable-new-table-tab__item-icons';
+const TABLE_MENU_SELECTOR = '.bitable-new-table-tab__item-icons, .bitable-new-table-item-icons, [class*="table-tab__item-icons"], [class*="new-table-item-icons"]';
 const TABLE_SCAN_TIMEOUT_MS = 3_000;
 const SYNC_CONFIRM_TIMEOUT_MS = 2_000;
 const SYNC_POLL_INTERVAL_MS = 250;
@@ -105,19 +105,51 @@ async function snapshotTableNames(page, deadline) {
   return [...new Set(names.map(cleanName).filter(Boolean))];
 }
 
-async function findTableRow(page, tableName, timeoutMs = TABLE_SCAN_TIMEOUT_MS) {
+async function findTableName(page, tableName, timeoutMs = TABLE_SCAN_TIMEOUT_MS) {
   const names = page.locator(TABLE_NAME_SELECTOR).filter({ visible: true });
   const count = await withTimeout(names.count(), timeoutMs, 'TABLE_RELOCATE_TIMEOUT');
 
   for (let index = 0; index < count; index += 1) {
+    const candidate = names.nth(index);
     const name = cleanName(await withTimeout(
-      names.nth(index).innerText({ timeout: timeoutMs }),
+      candidate.innerText({ timeout: timeoutMs }),
       timeoutMs,
       'TABLE_RELOCATE_TIMEOUT'
     ));
-    if (name === tableName) return names.nth(index).locator(TABLE_ROW_XPATH);
+    if (name === tableName) return candidate;
   }
   fail('TABLE_NOT_FOUND_AFTER_REFRESH');
+}
+
+async function findTableRow(page, tableName, timeoutMs = TABLE_SCAN_TIMEOUT_MS) {
+  const name = await findTableName(page, tableName, timeoutMs);
+  return name.locator(TABLE_ROW_XPATH);
+}
+
+function tableMenuPoint(box) {
+  if (!box) return null;
+  return {
+    x: box.x + Math.max(8, box.width - 16),
+    y: box.y + box.height / 2
+  };
+}
+
+async function selectTable(page, tableName, timeoutMs) {
+  let name = await findTableName(page, tableName, timeoutMs);
+  let row = name.locator(TABLE_ROW_XPATH);
+  await row.evaluate((element) => element.scrollIntoView({ block: 'nearest' })).catch(() => {});
+
+  const className = await row.getAttribute('class').catch(() => '');
+  if (!/active/i.test(String(className || ''))) {
+    try {
+      await name.click({ timeout: Math.min(1_000, timeoutMs), force: true });
+    } catch (_) {
+      const box = await name.boundingBox().catch(() => null);
+      if (!box) fail('TABLE_SELECT_FAILED');
+      await page.mouse.click(box.x + Math.min(24, Math.max(4, box.width / 2)), box.y + box.height / 2);
+    }
+    await page.waitForTimeout(120);
+  }
 }
 
 async function detectConnector(page, tableName) {
@@ -127,32 +159,64 @@ async function detectConnector(page, tableName) {
 }
 
 async function openTableMenu(page, tableName, deadline) {
-  // Re-locate immediately before interaction. Feishu rerenders the sidebar after syncs,
-  // so do not reuse old locators or wait for long hover/actionability checks.
+  // Feishu only exposes a reliable menu hit-area for the active/hovered row.
+  // Select the table first, then re-locate the freshly rendered row before each attempt.
+  // A geometry click near the row's right edge is the final fallback because the visible
+  // ellipsis button is sometimes omitted from Playwright's actionability tree.
   await page.keyboard.press('Escape').catch(() => {});
   const timeout = Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline));
-  const row = await findTableRow(page, tableName, timeout);
-  const menuButton = row.locator(TABLE_MENU_SELECTOR).first();
-
-  // Prefer a normal Playwright click, but Feishu hides/moves the menu icon during sidebar
-  // rerenders. Dispatching hover events and using a DOM click fallback avoids a 3s stall
-  // on every affected row while still clicking the same real menu control.
-  await row.evaluate((element) => {
-    element.scrollIntoView({ block: 'nearest' });
-    element.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-    element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-  }).catch(() => {});
-  await page.waitForTimeout(80);
-
-  try {
-    await menuButton.click({ timeout: Math.min(1_000, timeout), force: true });
-  } catch (_) {
-    await menuButton.evaluate((element) => element.click()).catch(() => fail('TABLE_MENU_CLICK_FAILED'));
-  }
+  await selectTable(page, tableName, timeout);
 
   const syncButton = page.getByText(MENU_TEXT, { exact: true }).filter({ visible: true }).first();
-  await syncButton.waitFor({ state: 'visible', timeout });
-  return syncButton;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (remainingMs(deadline) <= 0) fail('BASE_TIMEOUT_8_MINUTES');
+    const attemptTimeout = Math.min(900, timeout, remainingMs(deadline));
+    const row = await findTableRow(page, tableName, Math.max(250, attemptTimeout));
+    await row.evaluate((element) => element.scrollIntoView({ block: 'nearest' })).catch(() => {});
+    const box = await row.boundingBox().catch(() => null);
+    const point = tableMenuPoint(box);
+    if (point) {
+      await page.mouse.move(point.x, point.y).catch(() => {});
+      await page.waitForTimeout(80);
+    }
+
+    let clicked = false;
+    if (attempt === 0) {
+      const menuButton = row.locator(TABLE_MENU_SELECTOR).filter({ visible: true }).first();
+      if (await visible(menuButton)) {
+        clicked = await menuButton.click({ timeout: attemptTimeout, force: true })
+          .then(() => true)
+          .catch(() => false);
+      }
+    }
+
+    if (!clicked && point) {
+      clicked = await page.mouse.click(point.x, point.y)
+        .then(() => true)
+        .catch(() => false);
+    }
+
+    if (!clicked && attempt === 2) {
+      const menuButton = row.locator(TABLE_MENU_SELECTOR).first();
+      clicked = await menuButton.evaluate((element) => element.click())
+        .then(() => true)
+        .catch(() => false);
+    }
+
+    if (clicked) {
+      const opened = await syncButton.waitFor({ state: 'visible', timeout: Math.min(700, remainingMs(deadline)) })
+        .then(() => true)
+        .catch(() => false);
+      if (opened) return syncButton;
+    }
+
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(80);
+    await selectTable(page, tableName, Math.min(timeout, remainingMs(deadline)));
+  }
+
+  fail('TABLE_MENU_CLICK_FAILED');
 }
 
 function successToastLocator(page) {
@@ -358,9 +422,11 @@ module.exports = {
   cleanName,
   detectConnector,
   evaluateSyncSnapshot,
+  findTableName,
   findTableRow,
   processTableNames,
   relativeAgeSeconds,
   snapshotTableNames,
+  tableMenuPoint,
   withTimeout
 };
