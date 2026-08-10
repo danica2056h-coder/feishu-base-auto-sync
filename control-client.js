@@ -37,10 +37,10 @@ function responseError(code, response, contentType, text, isHtml = false) {
 async function callApi(payload) {
   required(API_URL, 'CONTROL_API_URL_MISSING');
   required(API_SECRET, 'CONTROL_API_SECRET_MISSING');
-  const isCheck = payload.action === 'check';
+  const isClaim = payload.action === 'claim';
   let requestUrl = API_URL;
-  const options = { method: isCheck ? 'GET' : 'POST', redirect: 'follow' };
-  if (isCheck) {
+  const options = { method: isClaim ? 'GET' : 'POST', redirect: 'follow' };
+  if (isClaim) {
     const url = new URL(API_URL);
     Object.entries({ ...payload, secret: API_SECRET }).forEach(([key, value]) => {
       if (value !== '' && value !== undefined && value !== null) url.searchParams.set(key, String(value));
@@ -79,10 +79,10 @@ async function callApi(payload) {
     }
     throw responseError(body.error, response, contentType, text);
   }
-  if (body.ok !== true || body.action !== payload.action) {
+  if (body.ok !== true || (body.action !== undefined && body.action !== payload.action)) {
     throw responseError('CONTROL_API_SCHEMA_INVALID', response, contentType, text);
   }
-  if (isCheck && !Array.isArray(body.tasks)) {
+  if (isClaim && !Array.isArray(body.tasks)) {
     throw responseError('CONTROL_API_SCHEMA_INVALID', response, contentType, text);
   }
   return body;
@@ -98,7 +98,7 @@ async function writeOutput(key, value) {
 }
 
 async function check(mode = 'due', row = '') {
-  const body = await callApi({ action: 'check', mode, row });
+  const body = await callApi({ action: 'claim', mode, row });
   const tasks = body.tasks;
   await writeOutput('has_tasks', tasks.length ? 'true' : 'false');
   await writeOutput('tasks', JSON.stringify(tasks));
