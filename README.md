@@ -44,7 +44,7 @@ BASE_SYNC_SUCCESS
 4. 手工运行一次 `initializeControlSheet`，确认授权。它只设置标题、checkbox 和时区，不删除 A/B 数据。
 5. 手工运行一次 `installOnEditTrigger`，创建可调用 GitHub API 的安装型 onEdit trigger。
 6. 部署为 Web app：以本人身份执行，允许 GitHub Actions 访问。Sheet 本身无需公开；API 仍要求共享 Secret。
-7. 复制部署 URL。代码更新后需部署新版本，并保持 GitHub Secret URL 。
+7. 复制部署 URL。代码更新后需部署新版本，并保持 GitHub Secret URL 指向当前部署。
 
 这是必须由 Google 账号本人完成的授权步骤：`NEED_GOOGLE_APPS_SCRIPT_DEPLOY`。
 
