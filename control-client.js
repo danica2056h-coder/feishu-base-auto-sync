@@ -11,12 +11,20 @@ function required(value, code) {
 async function callApi(payload) {
   required(API_URL, 'CONTROL_API_URL_MISSING');
   required(API_SECRET, 'CONTROL_API_SECRET_MISSING');
-  const response = await fetch(API_URL, {
-    method: 'POST',
-    redirect: 'follow',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ...payload, secret: API_SECRET })
-  });
+  const isClaim = payload.action === 'claim';
+  let requestUrl = API_URL;
+  const options = { method: isClaim ? 'GET' : 'POST', redirect: 'follow' };
+  if (isClaim) {
+    const url = new URL(API_URL);
+    Object.entries({ ...payload, secret: API_SECRET }).forEach(([key, value]) => {
+      if (value !== '' && value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    });
+    requestUrl = url.toString();
+  } else {
+    options.headers = { 'content-type': 'application/json' };
+    options.body = JSON.stringify({ ...payload, secret: API_SECRET });
+  }
+  const response = await fetch(requestUrl, options);
   const text = await response.text();
   let body;
   try { body = JSON.parse(text); } catch { throw new Error(`CONTROL_API_INVALID_RESPONSE_${response.status}`); }
