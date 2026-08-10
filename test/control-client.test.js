@@ -24,32 +24,73 @@ async function captureErrors(callback) {
   return lines;
 }
 
-test('check sends GET parameters and accepts tasks=[]', async () => {
+async function captureLogs(callback) {
+  const original = console.log;
+  const lines = [];
+  console.log = (...values) => lines.push(values.join(' '));
+  try { return { result: await callback(), lines }; }
+  finally { console.log = original; }
+}
+
+test('CLI check sends API action=claim for scheduled/due mode and accepts no tasks', async () => {
   let request;
   global.fetch = async (url, options) => {
     request = { url: new URL(url), options };
-    return response(JSON.stringify({ ok: true, action: 'check', tasks: [] }));
+    return response(JSON.stringify({ ok: true, tasks: [] }));
   };
 
-  assert.deepEqual(await check('due', ''), []);
+  const { result, lines } = await captureLogs(() => check('due', ''));
+  assert.deepEqual(result, []);
   assert.equal(request.options.method, 'GET');
   assert.equal(request.options.body, undefined);
-  assert.equal(request.url.searchParams.get('action'), 'check');
+  assert.equal(request.url.searchParams.get('action'), 'claim');
   assert.equal(request.url.searchParams.get('mode'), 'due');
+  assert.equal(request.url.searchParams.has('row'), false);
   assert.equal(request.url.searchParams.get('secret'), 'test-secret');
+  assert.ok(lines.includes('has_tasks=false'));
+  assert.ok(lines.includes('tasks=[]'));
+  assert.ok(lines.includes('NO_DUE_TASKS'));
 });
 
-test('check accepts a valid task array', async () => {
+test('CLI check preserves row mode and exposes workflow-compatible task outputs', async () => {
+  let request;
   const tasks = [{ row: 2, baseUrl: 'https://example.invalid/base', lockKey: 'abc' }];
-  global.fetch = async () => response(JSON.stringify({ ok: true, action: 'check', tasks }));
-  assert.deepEqual(await check('row', '2'), tasks);
+  global.fetch = async (url, options) => {
+    request = { url: new URL(url), options };
+    return response(JSON.stringify({ ok: true, tasks }));
+  };
+
+  const { result, lines } = await captureLogs(() => check('row', '2'));
+  assert.deepEqual(result, tasks);
+  assert.equal(request.url.searchParams.get('action'), 'claim');
+  assert.equal(request.url.searchParams.get('mode'), 'row');
+  assert.equal(request.url.searchParams.get('row'), '2');
+  assert.ok(lines.includes('has_tasks=true'));
+  assert.ok(lines.includes(`tasks=${JSON.stringify(tasks)}`));
+});
+
+test('claim accepts an explicit matching action in a forward-compatible response', async () => {
+  const tasks = [{ row: 3, baseUrl: 'https://example.invalid/base/3', lockKey: 'def' }];
+  global.fetch = async () => response(JSON.stringify({ ok: true, action: 'claim', tasks }));
+  const { result } = await captureLogs(() => check('all', ''));
+  assert.deepEqual(result, tasks);
+});
+
+test('check no longer sends the action that causes INVALID_ACTION', async () => {
+  global.fetch = async (url) => {
+    const action = new URL(url).searchParams.get('action');
+    if (action !== 'claim') return response(JSON.stringify({ ok: false, error: 'INVALID_ACTION' }));
+    return response(JSON.stringify({ ok: true, tasks: [] }));
+  };
+  const { result } = await captureLogs(() => check('due', ''));
+  assert.deepEqual(result, []);
 });
 
 test('completion uses POST with the unified JSON response', async () => {
   let request;
   global.fetch = async (url, options) => {
     request = { url, options };
-    return response(JSON.stringify({ ok: true, action: 'complete' }));
+    return response(JSON.stringify({ ok: true }));
   };
 
   await callApi({ action: 'complete', row: 2, status: '成功', durationMs: 1000 });
@@ -63,7 +104,7 @@ test('completion uses POST with the unified JSON response', async () => {
 test('HTTP 200 HTML is classified explicitly', async () => {
   global.fetch = async () => response('<!DOCTYPE html><html><body>Not the API</body></html>', 200, 'text/html');
   const lines = await captureErrors(async () => {
-    await assert.rejects(() => callApi({ action: 'check', mode: 'due' }), { message: 'CONTROL_API_HTML_RESPONSE' });
+    await assert.rejects(() => callApi({ action: 'claim', mode: 'due' }), { message: 'CONTROL_API_HTML_RESPONSE' });
   });
   assert.ok(lines.includes('CONTROL_API_STATUS=200'));
   assert.ok(lines.includes('CONTROL_API_CONTENT_TYPE=text/html'));
@@ -74,7 +115,7 @@ test('HTTP 200 HTML is classified explicitly', async () => {
 test('Google login HTML is classified as authorization required', async () => {
   global.fetch = async () => response('<html><a href="https://accounts.google.com/ServiceLogin">Sign in</a></html>', 200, 'text/html');
   await captureErrors(() => assert.rejects(
-    () => callApi({ action: 'check', mode: 'due' }),
+    () => callApi({ action: 'claim', mode: 'due' }),
     { message: 'CONTROL_API_GOOGLE_AUTH_REQUIRED' }
   ));
 });
@@ -82,15 +123,23 @@ test('Google login HTML is classified as authorization required', async () => {
 test('HTTP 200 invalid JSON is classified explicitly', async () => {
   global.fetch = async () => response('not-json');
   await captureErrors(() => assert.rejects(
-    () => callApi({ action: 'check', mode: 'due' }),
+    () => callApi({ action: 'claim', mode: 'due' }),
     { message: 'CONTROL_API_INVALID_JSON' }
   ));
 });
 
-test('HTTP 200 invalid JSON schema is classified explicitly', async () => {
-  global.fetch = async () => response(JSON.stringify({ ok: true, tasks: [] }));
+test('claim requires a task array', async () => {
+  global.fetch = async () => response(JSON.stringify({ ok: true }));
   await captureErrors(() => assert.rejects(
-    () => callApi({ action: 'check', mode: 'due' }),
+    () => callApi({ action: 'claim', mode: 'due' }),
+    { message: 'CONTROL_API_SCHEMA_INVALID' }
+  ));
+});
+
+test('an explicit mismatched response action is rejected', async () => {
+  global.fetch = async () => response(JSON.stringify({ ok: true, action: 'check', tasks: [] }));
+  await captureErrors(() => assert.rejects(
+    () => callApi({ action: 'claim', mode: 'due' }),
     { message: 'CONTROL_API_SCHEMA_INVALID' }
   ));
 });
@@ -100,7 +149,7 @@ test('HTTP 401 and 403 retain their status codes', async (context) => {
     await context.test(String(status), async () => {
       global.fetch = async () => response(JSON.stringify({ ok: false, error: 'UNAUTHORIZED' }), status);
       await captureErrors(() => assert.rejects(
-        () => callApi({ action: 'check', mode: 'due' }),
+        () => callApi({ action: 'claim', mode: 'due' }),
         { message: `CONTROL_API_HTTP_${status}` }
       ));
     });
