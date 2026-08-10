@@ -21,7 +21,6 @@ const KEY_FILE = 'FEISHU_AUTH_KEY.txt';
 
   await writeFile(ENCRYPTED_FILE, envelope, { mode: 0o600 });
   await writeFile(KEY_FILE, key.toString('base64'), { mode: 0o600 });
-
   console.log('AUTH_ENCRYPTED');
   console.log('KEY_FILE_CREATED');
 })().catch(() => {

@@ -1,0 +1,103 @@
+name: Feishu Base Auto Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Control rows to claim
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - due
+          - row
+      row:
+        description: Sheet row (only for mode=row)
+        required: false
+        type: string
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  check-control-sheet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      has_tasks: ${{ steps.check.outputs.has_tasks }}
+      tasks: ${{ steps.check.outputs.tasks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: check
+        name: Lightweight control-sheet check
+        env:
+          CONTROL_API_URL: ${{ secrets.CONTROL_API_URL }}
+          CONTROL_API_SECRET: ${{ secrets.CONTROL_API_SECRET }}
+          CHECK_MODE: ${{ github.event_name == 'schedule' && 'due' || inputs.mode }}
+          CHECK_ROW: ${{ inputs.row }}
+        run: node control-client.js check "$CHECK_MODE" "$CHECK_ROW"
+
+  sync:
+    needs: check-control-sheet
+    if: needs.check-control-sheet.outputs.has_tasks == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        task: ${{ fromJSON(needs.check-control-sheet.outputs.tasks) }}
+    concurrency:
+      group: feishu-base-${{ matrix.task.lockKey }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - id: started
+        shell: bash
+        run: echo "milliseconds=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Decrypt Feishu authentication
+        run: node decrypt-auth.js
+        env:
+          FEISHU_AUTH_KEY: ${{ secrets.FEISHU_AUTH_KEY }}
+      - id: sync
+        name: Sync every connector table in Base
+        continue-on-error: true
+        run: node sync-feishu.js
+        env:
+          FEISHU_BASE_URL: ${{ matrix.task.baseUrl }}
+      - name: Write status back to control sheet
+        if: always()
+        shell: bash
+        env:
+          CONTROL_API_URL: ${{ secrets.CONTROL_API_URL }}
+          CONTROL_API_SECRET: ${{ secrets.CONTROL_API_SECRET }}
+          CONTROL_ROW: ${{ matrix.task.row }}
+          STARTED_MS: ${{ steps.started.outputs.milliseconds }}
+          SYNC_OUTCOME: ${{ steps.sync.outcome }}
+        run: |
+          now_ms=$(date +%s%3N)
+          duration_ms=$((now_ms - STARTED_MS))
+          if [ "$SYNC_OUTCOME" = "success" ]; then
+            status="成功"
+          else
+            status="失败"
+          fi
+          SYNC_DURATION_MS="$duration_ms" node control-client.js complete "$status"
+      - name: Clean up decrypted authentication
+        if: always()
+        run: rm -f playwright/.auth/feishu.json
+      - name: Enforce sync result
+        if: always() && steps.sync.outcome != 'success'
+        run: exit 1

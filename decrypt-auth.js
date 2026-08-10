@@ -29,10 +29,7 @@ if (!encodedKey) {
 
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(authTag);
-    const plaintext = Buffer.concat([
-      decipher.update(ciphertext),
-      decipher.final()
-    ]);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 
     await mkdir(AUTH_DIR, { recursive: true });
     await writeFile(AUTH_FILE, plaintext, { mode: 0o600 });
