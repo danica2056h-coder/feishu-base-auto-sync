@@ -1,27 +1,32 @@
 const CONTROL_SHEET_NAME = '同步配置';
 const CONTROL_TIME_ZONE = 'Asia/Shanghai';
 const CONTROL_COLUMNS = 6;
+const CONTROL_SPREADSHEET_ID = '1sECJFkdrO_67wkLi68Eh2602Z9N1ppNfBEQUTTFNa9Q';
 
 function doGet(e) {
-  return handleRequest_(e && e.parameter ? e.parameter : {});
+  return handleRequest_(e && e.parameter ? e.parameter : {}, 'GET');
 }
 
 function doPost(e) {
   let payload = {};
   try { payload = JSON.parse((e && e.postData && e.postData.contents) || '{}'); }
   catch (error) { return json_({ ok: false, error: 'INVALID_JSON' }); }
-  return handleRequest_(payload);
+  return handleRequest_(payload, 'POST');
 }
 
-function handleRequest_(payload) {
+function handleRequest_(payload, method) {
   try {
     verifySecret_(payload.secret);
-    if (payload.action === 'claim') return json_({ ok: true, tasks: claimTasks_(payload.mode || 'due', payload.row) });
-    if (payload.action === 'complete') {
+    if (method === 'GET' && payload.action === 'claim') {
+      return json_({ ok: true, tasks: claimTasks_(payload.mode || 'due', payload.row) });
+    }
+    if (method === 'POST' && payload.action === 'complete') {
       completeTask_(payload);
       return json_({ ok: true });
     }
-    if (payload.action === 'health') return json_({ ok: true, timeZone: CONTROL_TIME_ZONE });
+    if (method === 'GET' && payload.action === 'health') {
+      return json_({ ok: true, timeZone: CONTROL_TIME_ZONE });
+    }
     throw new Error('INVALID_ACTION');
   } catch (error) {
     return json_({ ok: false, error: String(error.message || error).slice(0, 120) });
@@ -34,9 +39,13 @@ function verifySecret_(provided) {
 }
 
 function getControlSheet_() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONTROL_SHEET_NAME);
+  const sheet = getControlSpreadsheet_().getSheetByName(CONTROL_SHEET_NAME);
   if (!sheet) throw new Error('CONTROL_SHEET_NOT_FOUND');
   return sheet;
+}
+
+function getControlSpreadsheet_() {
+  return SpreadsheetApp.openById(CONTROL_SPREADSHEET_ID);
 }
 
 function parseRule_(value) {
@@ -197,7 +206,7 @@ function installOnEditTrigger() {
   ScriptApp.getProjectTriggers().forEach(function(trigger) {
     if (trigger.getHandlerFunction() === 'onControlEdit') ScriptApp.deleteTrigger(trigger);
   });
-  ScriptApp.newTrigger('onControlEdit').forSpreadsheet(SpreadsheetApp.getActive()).onEdit().create();
+  ScriptApp.newTrigger('onControlEdit').forSpreadsheet(getControlSpreadsheet_()).onEdit().create();
 }
 
 function initializeControlSheet() {
@@ -208,7 +217,7 @@ function initializeControlSheet() {
   const rowCount = Math.max(sheet.getMaxRows() - 1, 1);
   sheet.getRange(2, 3, rowCount, 1).insertCheckboxes();
   sheet.getRange(2, 5, rowCount, 1).setNumberFormat('@');
-  SpreadsheetApp.getActive().setSpreadsheetTimeZone(CONTROL_TIME_ZONE);
+  getControlSpreadsheet_().setSpreadsheetTimeZone(CONTROL_TIME_ZONE);
 }
 
 function json_(value) {
