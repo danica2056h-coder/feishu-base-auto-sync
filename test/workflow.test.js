@@ -14,7 +14,11 @@ test('production workflow is installed only under .github/workflows', () => {
 test('lightweight check cannot install browser dependencies', () => {
   const checkJob = workflow.split(/^  sync:/m)[0];
   assert.doesNotMatch(checkJob, /npm ci|playwright install|decrypt-auth|sync-feishu/);
+  assert.match(checkJob, /has_tasks: \$\{\{ steps\.check\.outputs\.has_tasks \}\}/);
+  assert.match(checkJob, /tasks: \$\{\{ steps\.check\.outputs\.tasks \}\}/);
+  assert.match(checkJob, /node control-client\.js check "\$CHECK_MODE" "\$CHECK_ROW"/);
   assert.match(workflow, /if: needs\.check-control-sheet\.outputs\.has_tasks == 'true'/);
+  assert.match(workflow, /task: \$\{\{ fromJSON\(needs\.check-control-sheet\.outputs\.tasks\) \}\}/);
 });
 
 test('heavy job is serialized per Base and retains required stages', () => {
