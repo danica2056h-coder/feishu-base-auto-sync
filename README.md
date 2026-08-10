@@ -24,7 +24,7 @@ Google Sheet“飞书自动刷新控制台”是唯一控制台。每一行对�
 关键成功日志：
 
 ```text
-BASE_START=<base url>
+BASE=<base url>
 TABLE_FOUND=<真实表名>
 TABLE_SYNC_START=<真实表名>
 TABLE_SYNC_SUCCESS=<真实表名>
@@ -40,16 +40,11 @@ BASE_SYNC_SUCCESS
 
 1. 打开控制表，进入“扩展程序 → Apps Script”。
 2. 将 `apps-script/Code.gs` 内容放入脚本项目。
-3. 在 Script Properties 设置：
-   - `CONTROL_API_SECRET`：自行生成的高强度随机值。
-   - `GITHUB_TOKEN`：可选；真正即时触发 C 列时需要。仅授予本仓库 Actions 写权限。
-   - `GITHUB_OWNER=danica2056h-coder`
-   - `GITHUB_REPO=feishu-base-auto-sync`
-   - `GITHUB_WORKFLOW=feishu-sync.yml`
+3. 在 Script Properties 设置 `CONTROL_API_SECRET`。真正即时触发 C 列时，再设置仅对本仓库 Actions 有写权限的 `GITHUB_TOKEN`；仓库名和 workflow 已有安全默认值，无需额外配置。
 4. 手工运行一次 `initializeControlSheet`，确认授权。它只设置标题、checkbox 和时区，不删除 A/B 数据。
 5. 手工运行一次 `installOnEditTrigger`，创建可调用 GitHub API 的安装型 onEdit trigger。
 6. 部署为 Web app：以本人身份执行，允许 GitHub Actions 访问。Sheet 本身无需公开；API 仍要求共享 Secret。
-7. 复制部署 URL。代码更新后需部署新版本，并保持 GitHub Secret URL 指向当前部署。
+7. 复制部署 URL。代码更新后需部署新版本，并保持 GitHub Secret URL 指向当��部署。
 
 这是必须由 Google 账号本人完成的授权步骤：`NEED_GOOGLE_APPS_SCRIPT_DEPLOY`。
 
