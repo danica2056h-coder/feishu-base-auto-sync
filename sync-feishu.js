@@ -6,7 +6,8 @@ const TABLE_ROW_XPATH = 'xpath=ancestor::div[contains(@class,"bitable-new-table-
 const CONNECTOR_ICON_SELECTOR = '.sync-icon-wrapper';
 const TABLE_MENU_SELECTOR = '.bitable-new-table-tab__item-icons';
 const TABLE_SCAN_TIMEOUT_MS = 3_000;
-const SYNC_CONFIRM_TIMEOUT_MS = 120_000;
+const SYNC_CONFIRM_TIMEOUT_MS = 60_000;
+const SYNC_POLL_INTERVAL_MS = 1_500;
 const MAX_BASE_DURATION_MS = 8 * 60_000;
 
 class SyncError extends Error {
@@ -20,12 +21,58 @@ function cleanName(value) {
   return String(value || '').split('\n').map((part) => part.trim()).find(Boolean) || '';
 }
 
+function normalizeText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
 function errorCode(error) {
   return error?.code || error?.message || 'SYNC_FAILED';
 }
 
 function remainingMs(deadline) {
   return Math.max(0, deadline - Date.now());
+}
+
+function relativeAgeSeconds(value) {
+  const text = normalizeText(value);
+  if (!text) return null;
+  if (/刚刚|刚才|少于\s*1\s*分钟|不到\s*1\s*分钟/.test(text)) return 0;
+  let match = text.match(/(\d+)\s*秒前/);
+  if (match) return Number(match[1]);
+  match = text.match(/(\d+)\s*分钟前/);
+  if (match) return Number(match[1]) * 60;
+  match = text.match(/(\d+)\s*小时前/);
+  if (match) return Number(match[1]) * 3600;
+  match = text.match(/(\d+)\s*天前/);
+  if (match) return Number(match[1]) * 86400;
+  return null;
+}
+
+function evaluateSyncSnapshot(before, after, sawProgress = false) {
+  const beforeText = normalizeText(before?.text);
+  const afterText = normalizeText(after?.text);
+  const progress = Boolean(after?.progress || after?.disabled);
+
+  if (/同步成功|同步完成|数据同步完成/.test(afterText)) {
+    return { confirmed: true, progress, signal: 'SUCCESS_TEXT' };
+  }
+
+  const beforeAge = relativeAgeSeconds(beforeText);
+  const afterAge = relativeAgeSeconds(afterText);
+  if (afterAge !== null) {
+    if (afterAge <= 5 && (beforeAge === null || beforeAge > 5 || beforeText !== afterText)) {
+      return { confirmed: true, progress, signal: 'FRESH_LAST_SYNC' };
+    }
+    if (beforeAge !== null && afterAge + 5 < beforeAge) {
+      return { confirmed: true, progress, signal: 'LAST_SYNC_BECAME_NEWER' };
+    }
+  }
+
+  if (sawProgress && !progress && afterText && !/失败|异常|错误/.test(afterText)) {
+    return { confirmed: true, progress, signal: 'PROGRESS_FINISHED' };
+  }
+
+  return { confirmed: false, progress, signal: null };
 }
 
 async function withTimeout(promise, timeoutMs, code) {
@@ -96,31 +143,122 @@ function successToastLocator(page) {
     .filter({ visible: true }).first();
 }
 
-async function waitForSync(page, previousText, timeoutMs, allowToast) {
-  const toastPromise = allowToast
-    ? successToastLocator(page).waitFor({ state: 'visible', timeout: timeoutMs }).then(() => true)
-    : Promise.reject(new Error('STALE_SUCCESS_TOAST'));
-  const changedPromise = previousText
-    ? page.waitForFunction((oldText) => {
-        const current = document.body.innerText.split('\n').find((row) => /上次同步|最近同步/.test(row));
-        return Boolean(current && current !== oldText);
-      }, previousText, { timeout: timeoutMs }).then(() => true)
-    : new Promise((_, reject) => setTimeout(() => reject(new Error('NO_PREVIOUS_SYNC_TEXT')), timeoutMs));
-  return Promise.any([toastPromise, changedPromise]).catch(() => false);
+async function readSyncMenuSnapshot(syncButton) {
+  const snapshot = await syncButton.evaluate((element) => {
+    let node = element;
+    let bestText = (element.innerText || element.textContent || '').trim();
+    let disabled = false;
+
+    for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+      const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+      const className = typeof node.className === 'string' ? node.className : '';
+      if (node.getAttribute?.('aria-disabled') === 'true' || /disabled|is-disabled/i.test(className)) {
+        disabled = true;
+      }
+      if (text && text.length <= 500 && /上次同步|最近同步|同步中|正在同步|同步完成|同步成功/.test(text)) {
+        bestText = text;
+        break;
+      }
+    }
+
+    return {
+      text: bestText,
+      disabled,
+      progress: /同步中|正在同步|同步进行中|更新中|正在更新|刷新中/.test(bestText)
+    };
+  }).catch(() => ({ text: '', disabled: false, progress: false }));
+
+  return {
+    text: normalizeText(snapshot.text),
+    disabled: Boolean(snapshot.disabled),
+    progress: Boolean(snapshot.progress)
+  };
+}
+
+async function readCurrentSyncState(page, tableName, deadline) {
+  await page.keyboard.press('Escape').catch(() => {});
+  const timeout = Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline));
+  if (timeout <= 0) fail('BASE_TIMEOUT_8_MINUTES');
+
+  const row = await findTableRow(page, tableName, timeout);
+  await row.hover({ timeout });
+  await row.locator(TABLE_MENU_SELECTOR).first().click({ timeout });
+
+  const progressText = page.getByText(/同步中|正在同步|同步进行中|更新中|正在更新|刷新中/, { exact: false })
+    .filter({ visible: true }).first();
+  if (await visible(progressText)) {
+    const snapshot = {
+      text: normalizeText(await progressText.textContent().catch(() => '同步中')),
+      disabled: true,
+      progress: true
+    };
+    await page.keyboard.press('Escape').catch(() => {});
+    return snapshot;
+  }
+
+  const syncButton = page.getByText(MENU_TEXT, { exact: true }).filter({ visible: true }).first();
+  try {
+    await syncButton.waitFor({ state: 'visible', timeout });
+    const snapshot = await readSyncMenuSnapshot(syncButton);
+    await page.keyboard.press('Escape').catch(() => {});
+    return snapshot;
+  } catch (error) {
+    await page.keyboard.press('Escape').catch(() => {});
+    throw error;
+  }
+}
+
+async function waitForSync(page, tableName, before, timeoutMs, deadline, initialToastVisible = false) {
+  const confirmDeadline = Math.min(deadline, Date.now() + timeoutMs);
+  let sawProgress = false;
+  let probeFailures = 0;
+  let toastArmed = !initialToastVisible;
+
+  while (remainingMs(confirmDeadline) > 0) {
+    const toastVisible = await visible(successToastLocator(page));
+    if (!toastArmed && !toastVisible) toastArmed = true;
+    if (toastArmed && toastVisible) {
+      console.log(`SYNC_CONFIRM_SIGNAL=${tableName}:TOAST`);
+      return true;
+    }
+
+    try {
+      const after = await readCurrentSyncState(page, tableName, confirmDeadline);
+      const result = evaluateSyncSnapshot(before, after, sawProgress);
+      sawProgress = sawProgress || result.progress;
+      if (result.confirmed) {
+        console.log(`SYNC_CONFIRM_SIGNAL=${tableName}:${result.signal}`);
+        return true;
+      }
+      probeFailures = 0;
+    } catch (error) {
+      probeFailures += 1;
+      if (probeFailures >= 3) {
+        console.log(`SYNC_CONFIRM_PROBE_ERROR=${tableName}:${errorCode(error)}`);
+        probeFailures = 0;
+      }
+    }
+
+    const sleepMs = Math.min(SYNC_POLL_INTERVAL_MS, remainingMs(confirmDeadline));
+    if (sleepMs > 0) await page.waitForTimeout(sleepMs);
+  }
+
+  return false;
 }
 
 async function syncTable(page, tableName, deadline) {
   const previousToast = successToastLocator(page);
-  if (await visible(previousToast)) {
+  const initialToastVisible = await visible(previousToast);
+  if (initialToastVisible) {
     await previousToast.waitFor({ state: 'hidden', timeout: TABLE_SCAN_TIMEOUT_MS }).catch(() => {});
   }
-  const allowToast = !await visible(previousToast);
+
   const syncButton = await openTableMenu(page, tableName, deadline);
-  const lastSync = page.getByText(/上次同步|最近同步/, { exact: false }).filter({ visible: true }).first();
-  const before = await lastSync.textContent({ timeout: TABLE_SCAN_TIMEOUT_MS }).catch(() => null);
+  const before = await readSyncMenuSnapshot(syncButton);
   await syncButton.click({ timeout: Math.min(TABLE_SCAN_TIMEOUT_MS, remainingMs(deadline)) });
+
   const confirmTimeout = Math.min(SYNC_CONFIRM_TIMEOUT_MS, remainingMs(deadline));
-  if (!await waitForSync(page, before, confirmTimeout, allowToast)) fail('SYNC_NOT_CONFIRMED');
+  if (!await waitForSync(page, tableName, before, confirmTimeout, deadline, initialToastVisible)) fail('SYNC_NOT_CONFIRMED');
 }
 
 async function processTableNames(page, tableNames, options = {}) {
@@ -134,8 +272,12 @@ async function processTableNames(page, tableNames, options = {}) {
     connectorTablesFound: 0,
     syncSuccessCount: 0,
     syncFailedCount: 0,
-    successfulTableNames: []
+    successfulTableNames: [],
+    failedTableNames: [],
+    failureReasons: {}
   };
+  stats.failedTableNames ||= [];
+  stats.failureReasons ||= {};
 
   for (const tableName of tableNames) {
     if (remainingMs(deadline) <= 0) fail('BASE_TIMEOUT_8_MINUTES');
@@ -150,6 +292,8 @@ async function processTableNames(page, tableNames, options = {}) {
       );
     } catch (error) {
       stats.syncFailedCount += 1;
+      stats.failedTableNames.push(tableName);
+      stats.failureReasons[tableName] = errorCode(error);
       log(`TABLE_SCAN_ERROR=${tableName}`);
       log(`ERROR=${errorCode(error)}`);
       continue;
@@ -169,6 +313,8 @@ async function processTableNames(page, tableNames, options = {}) {
       log(`TABLE_SYNC_SUCCESS=${tableName}`);
     } catch (error) {
       stats.syncFailedCount += 1;
+      stats.failedTableNames.push(tableName);
+      stats.failureReasons[tableName] = errorCode(error);
       log(`TABLE_SCAN_ERROR=${tableName}`);
       log(`ERROR=${errorCode(error)}`);
       await page.keyboard.press('Escape').catch(() => {});
@@ -183,6 +329,8 @@ function printSummary(stats) {
   console.log(`SYNC_SUCCESS_COUNT=${stats.syncSuccessCount}`);
   console.log(`SYNC_FAILED_COUNT=${stats.syncFailedCount}`);
   console.log(`SYNC_SUCCESS_NAMES=${JSON.stringify(stats.successfulTableNames)}`);
+  console.log(`SYNC_FAILED_NAMES=${JSON.stringify(stats.failedTableNames || [])}`);
+  console.log(`SYNC_FAILURE_REASONS=${JSON.stringify(stats.failureReasons || {})}`);
 }
 
 async function run() {
@@ -194,7 +342,9 @@ async function run() {
     connectorTablesFound: 0,
     syncSuccessCount: 0,
     syncFailedCount: 0,
-    successfulTableNames: []
+    successfulTableNames: [],
+    failedTableNames: [],
+    failureReasons: {}
   };
   let browser;
   console.log(`BASE=${BASE_URL}`);
@@ -233,8 +383,10 @@ if (require.main === module) {
 module.exports = {
   cleanName,
   detectConnector,
+  evaluateSyncSnapshot,
   findTableRow,
   processTableNames,
+  relativeAgeSeconds,
   snapshotTableNames,
   withTimeout
 };
