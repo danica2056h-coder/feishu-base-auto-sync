@@ -7,7 +7,7 @@
     "save-auth": "node save-auth.js",
     "sync": "node sync-feishu.js",
     "control:check": "node control-client.js check",
-    "test": "node --test"
+    "test": "node --test --test-isolation=none"
   },
   "engines": {
     "node": ">=22"
