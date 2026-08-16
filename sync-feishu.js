@@ -9,6 +9,11 @@ const TABLE_SCAN_TIMEOUT_MS = 3_000;
 const SYNC_CONFIRM_TIMEOUT_MS = 2_000;
 const SYNC_POLL_INTERVAL_MS = 250;
 const MAX_BASE_DURATION_MS = 8 * 60_000;
+// The sidebar renders one row per table and does not virtualise. On a default 720px
+// viewport a Base with ~19 tables leaves most rows outside the viewport, where their
+// hover-only menu button never renders and every click fails. Give the page enough
+// height to lay out a large table list in one go.
+const VIEWPORT = { width: 1600, height: 2200 };
 
 class SyncError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -389,7 +394,7 @@ async function run() {
 
   try {
     browser = await withTimeout(chromium.launch({ headless: true }), remainingMs(deadline), 'BASE_TIMEOUT_8_MINUTES');
-    const context = await browser.newContext({ storageState: AUTH_FILE });
+    const context = await browser.newContext({ storageState: AUTH_FILE, viewport: VIEWPORT });
     const page = await context.newPage();
     await page.goto(BASE_URL, {
       waitUntil: 'domcontentloaded',
