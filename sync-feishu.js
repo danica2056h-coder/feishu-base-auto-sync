@@ -6,6 +6,10 @@ const TABLE_ROW_XPATH = 'xpath=ancestor::div[contains(@class,"bitable-new-table-
 const CONNECTOR_ICON_SELECTOR = '.sync-icon-wrapper';
 const TABLE_MENU_SELECTOR = '.bitable-new-table-tab__item-icons, .bitable-new-table-item-icons, [class*="table-tab__item-icons"], [class*="new-table-item-icons"]';
 const TABLE_SCAN_TIMEOUT_MS = 3_000;
+// Deciding whether one row is a connector re-reads every sidebar row, so the work grows
+// with the size of the Base. Each inner DOM call still gets TABLE_SCAN_TIMEOUT_MS; this
+// bounds their sum, which on a CI runner with ~19 tables exceeds a single 3s budget.
+const CONNECTOR_SCAN_TIMEOUT_MS = 15_000;
 const SYNC_CONFIRM_TIMEOUT_MS = 2_000;
 const SYNC_POLL_INTERVAL_MS = 250;
 const MAX_BASE_DURATION_MS = 8 * 60_000;
@@ -309,7 +313,7 @@ async function processTableNames(page, tableNames, options = {}) {
   const inspect = options.detectConnector || detectConnector;
   const sync = options.syncTable || syncTable;
   const log = options.log || console.log;
-  const scanTimeoutMs = options.scanTimeoutMs || TABLE_SCAN_TIMEOUT_MS;
+  const scanTimeoutMs = options.scanTimeoutMs || CONNECTOR_SCAN_TIMEOUT_MS;
   const stats = options.stats || {
     totalTables: tableNames.length,
     connectorTablesFound: 0,
