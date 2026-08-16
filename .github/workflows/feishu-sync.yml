@@ -74,9 +74,20 @@ jobs:
       - id: sync
         name: Sync every connector table in Base
         continue-on-error: true
-        run: node sync-feishu.js
+        shell: bash
+        run: |
+          set -o pipefail
+          node sync-feishu.js 2>&1 | tee sync-output.log
         env:
           FEISHU_BASE_URL: ${{ matrix.task.baseUrl }}
+      # Job logs need repo-admin rights to download, so lift the lines that explain a
+      # failure into annotations, which are readable from the run page and the API.
+      - name: Surface sync failure reasons
+        if: always() && steps.sync.outcome != 'success'
+        shell: bash
+        run: |
+          grep -E '^(ERROR=|TOTAL_TABLES=|CONNECTOR_TABLES_FOUND=|SYNC_FAILED_NAMES=|SYNC_FAILURE_REASONS=)' sync-output.log \
+            | while IFS= read -r line; do echo "::error::$line"; done
       - name: Write status back to control sheet
         if: always()
         shell: bash
